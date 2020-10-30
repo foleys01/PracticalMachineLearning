@@ -1,0 +1,197 @@
+---
+title: "Practical Machine Learning Course Project"
+author: "Shawn W. Foley"
+date: "10/28/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Summary
+The goal of this project is to generate a machine learning model to identify the "Class" of exercise performed from collected biometric data. After filtering and scaling, I generated random forest (RF), boosting (GBM), and linear discriminte analysis (LDA) models using all remaining variables. As accuracy, but not scalability, is the goal of this project I used these models to generate a stacked machine learning model. 
+
+Cross validation was performed by splitting the data into a training and validation set. Z normalization was performed on the training set, and the measured mean and standard deviation were used to scale the validation set. The normalized validation data were analyze by each of the four models (RF, GBM, LDA, and stacked) and out of sample error was estimated for each model. 
+
+I consistently found higher accuracy using the training data than the validation data, as expected. Both the RF and stacked models have identically high accuracy (>99%) and low expected out of sample error (<1%), indicating that the GBM and LDA models do **not** increase accuracy over the RF model alone.
+
+### Stratify and preprocess data
+
+I began this analysis by loading the plm-training.csv file and found 19,622 observations across 160 variables. As there are a large number of observations, I chose to split the data to perform cross validation. I randomly divided the observations into a training (70%) and validation set (30%).
+
+```{r loadData, echo=TRUE, results='hide'}
+#Load data and stratify into training and validating sets
+library(caret)
+library(ggplot2)
+set.seed(1020)
+exerciseData <- read.csv('~/Desktop/Coursera/Practical Machine Learning/pml-training.csv')
+
+#Create training set
+inTrain <- createDataPartition(exerciseData$classe,p=0.7,list=FALSE)
+training <- exerciseData[inTrain,]
+validating <- exerciseData[-inTrain,]
+```
+
+Several of these variables correspond to metadata that are likely uninformative (timestamps and time windows). These variables were removed, and the remaining string values were converted to factors for analysis.
+
+```{r cleanData, echo=TRUE, results='hide',error=FALSE,message=FALSE,warning=FALSE}
+#Remove metadata columns and set numeric and factor
+training <- training[,-which(colnames(training) %in% c('X','raw_timestamp_part_1','raw_timestamp_part_2','cvtd_timestamp','new_window'))]
+training <- training[,c(1,ncol(training),seq(2,ncol(training)-1))]
+training[,-seq(2)] <- apply(training[,-seq(2)],2,as.numeric)
+training[,seq(2)] <- apply(training[,seq(2)],2,factor)
+```
+
+As these data are on various scales, Z-scores were calculated to make the variables more comparable. Rather than imputing data, I removed the variable that have NAs present. These NAs corresponded to a vast majority of the observations for these variables, and they are equally split across the 6 exercise classes (data not shown).
+
+```{r zNorm, echo=TRUE, results='hide',error=FALSE,message=FALSE,warning=FALSE}
+#Generate Z score
+trainingMean <- apply(training[,-seq(2)],2,function(x) mean(x,na.rm=T))
+trainingSD <- apply(training[,-seq(2)],2,function(x) sd(x,na.rm=T))
+trainingZ <- NULL
+for (i in seq(3,ncol(training))) {
+  trainingZ <- cbind(trainingZ,(training[,i] - trainingMean[i-2]) / trainingSD[i-2])
+}
+colnames(trainingZ) <- colnames(training)[-seq(2)]
+trainingZ.noNA <- trainingZ[,colSums(is.na(trainingZ)) == 0]
+```
+
+### PCA plot
+
+Taking these data, I generated a PCA plot. There are clearly 6 clusters in the plot. I colored these points by exercise class, but did not observe any clear association between class and cluster. As individual users would likely have distinct exercise metrics, I then colored the points by username and observed an apparent association.
+
+```{r pca, echo=TRUE}
+pca <- as.data.frame(prcomp(trainingZ.noNA)$x)
+pca$classe <- training$classe
+pca$user_name <- training$user_name
+ggplot(pca,aes(x=PC1,y=PC2,col=classe)) + geom_point(alpha=0.2) + 
+  ggtitle("PCA of Exercise Data Colored by Classe") + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+ggplot(pca,aes(x=PC1,y=PC2,col=user_name)) + geom_point(alpha=0.2) + 
+  ggtitle("PCA of Exercise Data Colored by User") + 
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+### Model building
+
+The class and username were re-added to the normalized data, and several machine learning models were built. Random forest, boosting, and linear discriminate analysis models were generated, and a data frame of predicted outcomes for each model was compiled. As the goal of this project is accuracy rather than scalability, a stacked prediction model was generated. Random forest is often considered one of the most accurate machine larning methods, therefore these models were used as input to build a stacked model using random forest. 
+
+```{r buildModels, echo=TRUE, results='hide',cache=TRUE, error=FALSE,message=FALSE,warning=FALSE}
+training.norm <- as.data.frame(cbind(training$classe,training$user_name,trainingZ.noNA))
+colnames(training.norm)[seq(2)] <- c('classe','user_name')
+training.norm[,-seq(2)] <- apply(training.norm[,-seq(2)],2,as.numeric)
+
+#Build ML models
+rf <- train(classe ~ .,data=training.norm,method='rf')
+gbm <- train(classe ~ .,data=training.norm,method='gbm')
+lda <- train(classe ~ .,data=training.norm,method='lda')
+
+#Build stacked model
+pred.train <- data.frame(rf=predict(rf,training.norm),gbm=predict(gbm,training.norm),lda=predict(lda,training.norm),classe=training.norm$classe)
+stackedModel <- train(classe ~ .,data=pred.train,method='rf')
+```
+
+The accuracy of the four models (three individual and stacked) was then calculated.
+
+```{r trainingAcc, echo=TRUE}
+#Find accuracy of models
+trainingAcc <- c(
+  `Random Forest` = confusionMatrix(pred.train$rf,training.norm$classe)$overall['Accuracy'],
+  `Boosting` = confusionMatrix(pred.train$gbm,training.norm$classe)$overall['Accuracy'],
+  `LDA` = confusionMatrix(pred.train$lda,training.norm$classe)$overall['Accuracy'],
+    Stacked=confusionMatrix(predict(stackedModel,pred.train),pred.train$classe)$overall['Accuracy'])
+print(trainingAcc)
+```
+
+The random forest and stacked models perfectly assign the exercise class (accuracy = 1.0), indicating potential overfitting. To estimate the out of sample error, these models were tested on the validation dataset.
+
+### Validation and out of sample error
+
+To estimate out of sample error, I ran the machine learning models on the validation dataset. The validation data underwent the same processing as the training data: 
+  1. Metadata columns were removed.
+  2. Variables with NAs were removed.
+  3. Validation data was Z normalized using mean and standard deviation from the training set.
+
+```{r validation, echo=TRUE,error=FALSE,message=FALSE,warning=FALSE}
+#Remove metadata columns from validation data and convert variables to numeric/factor
+validating <- validating[,-which(colnames(validating) %in% c('X','raw_timestamp_part_1','raw_timestamp_part_2','cvtd_timestamp','new_window'))]
+validating <- validating[,c(1,ncol(validating),seq(2,ncol(validating)-1))]
+validating[,-seq(2)] <- apply(validating[,-seq(2)],2,as.numeric)
+validating[,seq(2)] <- apply(validating[,seq(2)],2,factor)
+
+#Z normalize using mean and SD from training set
+v <- NULL
+for (i in seq(3,ncol(validating))) {
+  v <- cbind(v,(validating[,i] - trainingMean[i-2]) / trainingSD[i-2])
+}
+colnames(v) <- colnames(validating)[-seq(2)]
+v.noNA <- v[,colSums(is.na(v)) == 0]
+v.norm <- as.data.frame(cbind(validating$classe,validating$user_name,v.noNA))
+colnames(v.norm)[seq(2)] <- c('classe','user_name')
+v.norm[,-seq(2)] <- apply(v.norm[,-seq(2)],2,as.numeric)
+
+#Data frame of predicted classes from random forest, boosting, and LDA models
+pred.val <- data.frame(rf=predict(rf,v.norm),gbm=predict(gbm,v.norm),lda=predict(lda,v.norm),classe=v.norm$classe)
+
+#Accuracy values from all four models
+valAcc <- c(
+  `Random Forest` = confusionMatrix(pred.val$rf,v.norm$classe)$overall['Accuracy'],
+  `Boosting` = confusionMatrix(pred.val$gbm,v.norm$classe)$overall['Accuracy'],
+  `LDA` = confusionMatrix(pred.val$lda,v.norm$classe)$overall['Accuracy'],
+  `Stacked` = confusionMatrix(predict(stackedModel,pred.val),v.norm$classe)$overall['Accuracy'])
+print(valAcc)
+```
+
+The LDA models clearly has the lowest accuracy, with boosting, then random forest and the stacked model having the highest. It is worth noting that the random forest algorithm has **equal** accuracy to the stacked algorithm, indicating that the additional models do **not** add any value or information to the random forest.
+
+### Calculate in and out of sample error
+
+As accuracy has already been calculated, the error rate is simply 1 - accuracy. The in and out of sample error rates were caluclated for each model and represented as a bar plot.
+
+```{r accuracyPlot, echo=TRUE}
+#Convert accuracy to error rate and generate barplots
+barplot(100*(1-rbind(trainingAcc,valAcc)),beside=T,
+        names=c('RF','GBM','LDA','Stacked'),
+        main='Error rate of models',ylab='Error rate (Percent)',
+        xlab='Model',col=c('firebrick','lightblue'))
+
+legend('topleft',c('Training','Validation'),
+       fill=c('firebrick','lightblue'), bty='n',cex=0.7)
+```
+
+As expected, the error rate of every model is higher in the validation set than the training set. This is likely due to overfitting. 
+
+Both the random forest and stacked algorithms have an expected out of sample error of <1%. Therefore, the random forest model will be used to identify the class of the training data and the output will be submitted for the course quiz. 
+
+### Predict classe for the test data
+
+**The test data were analyzed a single time after concluding that the random forest algorithm is >99% accurate. The code and results are below.**
+
+```{r testData, echo=TRUE}
+#Load test data
+testData <- read.csv('~/Desktop/Coursera/Practical Machine Learning/pml-testing.csv')
+
+#As the last column is "problem_id" rather than "classe" 
+#the code has been edited to ensure the processing is identical 
+#to the training and validation data.
+testData <- testData[,-which(colnames(testData) %in% c('X','raw_timestamp_part_1','raw_timestamp_part_2','cvtd_timestamp','new_window','problem_id'))]
+testData[,-1] <- apply(testData[,-1],2,as.numeric)
+testData[,1] <- factor(testData[,1])
+
+#Z normalize using mean and SD from training set
+testing <- NULL
+for (i in seq(2,ncol(testData))) {
+  testing <- cbind(testing,(testData[,i] - trainingMean[i-1]) / trainingSD[i-1])
+}
+colnames(testing) <- colnames(testData)[-1]
+testing.noNA <- testing[,colSums(is.na(testing)) == 0]
+testing.norm <- as.data.frame(testing.noNA)
+testing.norm$user_name <- testData$user_name
+testing.norm[,-ncol(testing.norm)] <- apply(testing.norm[,-ncol(testing.norm)],2,as.numeric)
+
+#Predicted testing classe
+data.frame(problem_id=seq(nrow(testing.norm)),classe=predict(rf,testing.norm))
+```
+
